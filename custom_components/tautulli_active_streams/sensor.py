@@ -37,7 +37,7 @@ def format_seconds_to_min_sec(total_seconds: float) -> str:
 async def _fetch_plex_metadata(plex_base_url, plex_token, rating_key):
     """
     Query Plex for metadata including chapters, markers, and other attributes.
-    Returns a tuple of (credits_offset, metadata_dict).
+    Returns a tuple of (credits_offset, metadata_dict, http_status).
     """
     url = (
         f"{plex_base_url}/library/metadata/{rating_key}"
@@ -48,11 +48,11 @@ async def _fetch_plex_metadata(plex_base_url, plex_token, rating_key):
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=10) as resp:
                 if resp.status != 200:
-                    _LOGGER.warning(
-                        "Failed to fetch XML for rating_key=%s: status=%s, reason=%s",
+                    _LOGGER.debug(
+                        "Plex metadata fetch failed for rating_key=%s: status=%s, reason=%s",
                         rating_key, resp.status, resp.reason
                     )
-                    return None, {}
+                    return None, {}, resp.status
 
                 # Parse XML
                 xml_body = await resp.text()
@@ -69,7 +69,7 @@ async def _fetch_plex_metadata(plex_base_url, plex_token, rating_key):
                 
                 # If no Video element found, return empty results
                 if video_el is None:
-                    return None, {}
+                    return None, {}, resp.status
 
 
                 # Initialize metadata dict
@@ -177,11 +177,11 @@ async def _fetch_plex_metadata(plex_base_url, plex_token, rating_key):
                     if field in video_el.attrib:
                         metadata[field] = video_el.attrib[field]
 
-                return credits_offset, metadata
+                return credits_offset, metadata, 200
 
     except Exception as err:
-        _LOGGER.warning("Error fetching Plex metadata for rating_key=%s: %s", rating_key, err)
-        return None, {}
+        _LOGGER.debug("Error fetching Plex metadata for rating_key=%s: %s", rating_key, err)
+        return None, {}, None
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -274,6 +274,7 @@ class TautulliStreamSensor(CoordinatorEntity, SensorEntity):
         self._last_state = STATE_OFF
         self._last_rating_key = None
         self._metadata_fetched = False
+        self._auth_warning_emitted = False
 
     @property
     def device_info(self):
@@ -336,6 +337,7 @@ class TautulliStreamSensor(CoordinatorEntity, SensorEntity):
             self._last_state = STATE_OFF
             self._last_rating_key = None
             self._metadata_fetched = False
+            self._auth_warning_emitted = False
             self._credits_start_time = None
             self._in_credits = False
 
@@ -361,9 +363,30 @@ class TautulliStreamSensor(CoordinatorEntity, SensorEntity):
             return
 
         try:
-            credits_offset, metadata = await _fetch_plex_metadata(
+            credits_offset, metadata, status = await _fetch_plex_metadata(
                 plex_base_url, plex_token, rating_key
             )
+
+            if status in (401, 403):
+                if not self._auth_warning_emitted:
+                    _LOGGER.warning(
+                        "Plex metadata authorization failed (status=%s). "
+                        "Skipping metadata enrichment for this stream; check plex_token in the "
+                        "'%s' config entry.",
+                        status,
+                        self._entry.title,
+                    )
+                    self._auth_warning_emitted = True
+                # Prevent per-second retry storms for the same session.
+                self._metadata_fetched = True
+                self._credits_start_time = None
+                return
+
+            if status and status != 200:
+                # Prevent per-second retry storms for the same session.
+                self._metadata_fetched = True
+                self._credits_start_time = None
+                return
             
             # Store credits offset for future checks
             if credits_offset:
@@ -376,7 +399,9 @@ class TautulliStreamSensor(CoordinatorEntity, SensorEntity):
             # Update session metadata in coordinator
             if metadata and "sessions" in self.coordinator.data:
                 self.coordinator.data["sessions"][self._index].update(metadata)
-                self._metadata_fetched = True
+            # Mark this stream as attempted, even when metadata is empty.
+            self._metadata_fetched = True
+            self._auth_warning_emitted = False
 
         except Exception as err:
             _LOGGER.warning("Error fetching full metadata: %s", err)
